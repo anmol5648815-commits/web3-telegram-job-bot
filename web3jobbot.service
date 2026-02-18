@@ -1,0 +1,25 @@
+[Unit]
+Description=Web3 Telegram Job Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/web3-telegram-job-bot
+EnvironmentFile=/home/botuser/web3-telegram-job-bot/.env
+ExecStart=/home/botuser/web3-telegram-job-bot/.venv/bin/python /home/botuser/web3-telegram-job-bot/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/home/botuser/web3-telegram-job-bot
+
+[Install]
+WantedBy=multi-user.target
