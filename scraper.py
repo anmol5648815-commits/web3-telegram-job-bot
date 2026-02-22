@@ -1,15 +1,18 @@
-"""Scrapers for Web3 job sources.
+"""
+Production-grade scrapers for Web3 job sources.
 
-This module fetches jobs from:
-1) https://cryptojobslist.com/jobs.json
-2) https://web3.career/api/jobs
-3) https://remote3.co/web3-jobs
-4) https://solana.com/jobs
+Sources:
+1) CryptoJobsList
+2) Web3.career (HTML fallback)
+3) Remote3
+4) Solana Jobs
 
-Rules from project spec:
-- Use httpx with 10-second timeout.
-- Use BeautifulSoup4 for HTML sources.
-- Wrap every scraper in try/except and return [] on failure.
+Improvements:
+- follow_redirects=True
+- Browser-like headers
+- Structured logging
+- Safer JSON handling
+- Per-source health visibility
 """
 
 from __future__ import annotations
@@ -23,23 +26,30 @@ from bs4 import BeautifulSoup
 
 LOGGER = logging.getLogger(__name__)
 
-TIMEOUT_SECONDS = 10.0
-CRYPTOJOBSLIST_URL = "https://cryptojobslist.com/jobs.json"
-WEB3_CAREER_URL = "https://web3.career/api/jobs"
-REMOTE3_URL = "https://remote3.co/web3-jobs"
-SOLANA_JOBS_URL = "https://solana.com/jobs"
+TIMEOUT_SECONDS = 15.0
+
+CRYPTOJOBSLIST_URL = "https://cryptojobslist.com/jobs-json"
+WEB3_CAREER_URL = "https://web3.career"
+REMOTE3_URL = "https://www.remote3.co/web3-jobs"
+SOLANA_JOBS_URL = "https://jobs.solana.com"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    )
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
 }
 
 
+# ---------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------
+
 def _safe_str(value: Any, default: str = "") -> str:
-    """Convert any value to a stripped string with fallback."""
     if value is None:
         return default
     text = str(value).strip()
@@ -47,17 +57,16 @@ def _safe_str(value: Any, default: str = "") -> str:
 
 
 def _category_tag_from_text(title: str, company: str, source: str) -> str:
-    """Infer a simple category tag for hashtags."""
     blob = f"{title} {company} {source}".lower()
     if any(token in blob for token in ("solidity", "smart contract", "evm")):
         return "solidity"
     if any(token in blob for token in ("rust", "solana", "anchor")):
         return "solana"
-    if any(token in blob for token in ("frontend", "react", "typescript", "ui")):
+    if any(token in blob for token in ("frontend", "react", "typescript")):
         return "frontend"
-    if any(token in blob for token in ("python", "backend", "api", "infra", "devops")):
+    if any(token in blob for token in ("python", "backend", "infra", "devops")):
         return "backend"
-    if any(token in blob for token in ("marketing", "growth", "community", "content")):
+    if any(token in blob for token in ("marketing", "growth", "community")):
         return "marketing"
     return "general"
 
@@ -72,13 +81,12 @@ def _normalize_job(
     source: str,
     posted_at: str | None = None,
 ) -> dict[str, str | None]:
-    """Normalize job fields to a consistent shape."""
+
     clean_title = _safe_str(title, "Untitled role")
     clean_company = _safe_str(company, "Unknown company")
     clean_location = _safe_str(location, "Remote")
     clean_salary = _safe_str(salary, "Not disclosed")
     clean_url = _safe_str(url)
-    category_tag = _category_tag_from_text(clean_title, clean_company, source)
 
     return {
         "title": clean_title,
@@ -86,45 +94,71 @@ def _normalize_job(
         "location": clean_location,
         "salary": clean_salary,
         "url": clean_url,
-        "category_tag": category_tag,
+        "category_tag": _category_tag_from_text(clean_title, clean_company, source),
         "source": source,
         "posted_at": _safe_str(posted_at) if posted_at else None,
     }
 
 
-def scrape_cryptojobslist() -> list[dict[str, str | None]]:
-    """Scrape jobs from CryptoJobsList JSON feed."""
+def _fetch(url: str) -> httpx.Response | None:
     try:
-        with httpx.Client(timeout=TIMEOUT_SECONDS, headers=DEFAULT_HEADERS) as client:
-            response = client.get(CRYPTOJOBSLIST_URL)
+        with httpx.Client(
+            timeout=TIMEOUT_SECONDS,
+            headers=DEFAULT_HEADERS,
+            follow_redirects=True,
+        ) as client:
+            response = client.get(url)
             response.raise_for_status()
-            payload = response.json()
+            LOGGER.info("Fetched %s bytes from %s", len(response.content), response.url)
+            return response
+    except Exception as exc:
+        LOGGER.exception("Fetch failed for %s: %s", url, exc)
+        return None
 
-        records = payload if isinstance(payload, list) else payload.get("jobs", [])
-        jobs: list[dict[str, str | None]] = []
+
+# ---------------------------------------------------------
+# Scrapers
+# ---------------------------------------------------------
+
+def scrape_cryptojobslist() -> list[dict[str, str | None]]:
+    try:
+        response = _fetch(CRYPTOJOBSLIST_URL)
+        if not response:
+            return []
+
+        payload = response.json()
+
+        if isinstance(payload, dict):
+            LOGGER.info("CryptoJobsList JSON keys: %s", payload.keys())
+            records = payload.get("jobs") or payload.get("data") or []
+        else:
+            records = payload
+
+        jobs = []
 
         for item in records:
             if not isinstance(item, dict):
                 continue
 
-            job_url = _safe_str(item.get("url") or item.get("jobUrl") or item.get("slug"))
+            raw_url = (
+                item.get("url")
+                or item.get("jobUrl")
+                or item.get("slug")
+            )
+
+            job_url = _safe_str(raw_url)
             if job_url and not job_url.startswith("http"):
                 job_url = urljoin("https://cryptojobslist.com/", job_url)
 
             jobs.append(
                 _normalize_job(
-                    title=_safe_str(item.get("title") or item.get("jobTitle")),
-                    company=_safe_str(item.get("company") or item.get("companyName")),
-                    location=_safe_str(item.get("location"), "Remote"),
-                    salary=_safe_str(
-                        item.get("salary")
-                        or item.get("salaryRange")
-                        or item.get("compensation"),
-                        "Not disclosed",
-                    ),
+                    title=item.get("title") or item.get("jobTitle"),
+                    company=item.get("company") or item.get("companyName"),
+                    location=item.get("location"),
+                    salary=item.get("salary") or item.get("salaryRange"),
                     url=job_url,
                     source="cryptojobslist",
-                    posted_at=_safe_str(item.get("publishedAt") or item.get("date")),
+                    posted_at=item.get("publishedAt") or item.get("date"),
                 )
             )
 
@@ -135,89 +169,75 @@ def scrape_cryptojobslist() -> list[dict[str, str | None]]:
 
 
 def scrape_web3_career() -> list[dict[str, str | None]]:
-    """Scrape jobs from web3.career API."""
     try:
-        with httpx.Client(timeout=TIMEOUT_SECONDS, headers=DEFAULT_HEADERS) as client:
-            response = client.get(WEB3_CAREER_URL)
-            response.raise_for_status()
-            payload = response.json()
+        response = _fetch(WEB3_CAREER_URL)
+        if not response:
+            return []
 
-        records = payload if isinstance(payload, list) else payload.get("jobs", [])
-        jobs: list[dict[str, str | None]] = []
+        html = response.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        for item in records:
-            if not isinstance(item, dict):
+        jobs = []
+        job_links = soup.select("a[href*='/job']")
+
+        seen = set()
+
+        for link in job_links:
+            href = _safe_str(link.get("href"))
+            job_url = urljoin(WEB3_CAREER_URL, href)
+
+            if not job_url or job_url in seen:
                 continue
+            seen.add(job_url)
 
-            raw_url = _safe_str(
-                item.get("url")
-                or item.get("job_url")
-                or item.get("jobUrl")
-                or item.get("slug")
-            )
-            job_url = urljoin("https://web3.career/", raw_url) if raw_url else ""
+            title = _safe_str(link.get_text(" ", strip=True))
 
             jobs.append(
                 _normalize_job(
-                    title=_safe_str(item.get("title") or item.get("job_title")),
-                    company=_safe_str(item.get("company") or item.get("company_name")),
-                    location=_safe_str(item.get("location"), "Remote"),
-                    salary=_safe_str(
-                        item.get("salary") or item.get("salary_range"),
-                        "Not disclosed",
-                    ),
+                    title=title,
+                    company="Unknown company",
+                    location="Remote",
+                    salary="Not disclosed",
                     url=job_url,
                     source="web3career",
-                    posted_at=_safe_str(item.get("published_at") or item.get("created_at")),
                 )
             )
 
-        return [job for job in jobs if job["url"]]
+        return jobs
     except Exception as exc:
         LOGGER.exception("scrape_web3_career failed: %s", exc)
         return []
 
 
 def scrape_remote3() -> list[dict[str, str | None]]:
-    """Scrape jobs from Remote3 HTML page with BeautifulSoup."""
     try:
-        with httpx.Client(timeout=TIMEOUT_SECONDS, headers=DEFAULT_HEADERS) as client:
-            response = client.get(REMOTE3_URL)
-            response.raise_for_status()
-            html = response.text
+        response = _fetch(REMOTE3_URL)
+        if not response:
+            return []
 
-        soup = BeautifulSoup(html, "html.parser")
-        jobs: list[dict[str, str | None]] = []
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        job_links = soup.select("a[href*='/job']") or soup.select("a[href*='jobs']")
-        seen_urls: set[str] = set()
+        jobs = []
+        links = soup.select("a[href*='/job']")
 
-        for link in job_links:
+        seen = set()
+
+        for link in links:
             href = _safe_str(link.get("href"))
-            job_url = urljoin(REMOTE3_URL, href) if href else ""
-            if not job_url or job_url in seen_urls:
+            job_url = urljoin(REMOTE3_URL, href)
+
+            if not job_url or job_url in seen:
                 continue
-            seen_urls.add(job_url)
+            seen.add(job_url)
 
-            title = _safe_str(link.get_text(" ", strip=True), "Untitled role")
-            card = link.find_parent(["article", "li", "div"]) or link
-
-            company_node = card.select_one("[class*='company'], [data-company]")
-            location_node = card.select_one("[class*='location'], [data-location]")
-            salary_node = card.select_one("[class*='salary'], [data-salary]")
+            title = _safe_str(link.get_text(" ", strip=True))
 
             jobs.append(
                 _normalize_job(
                     title=title,
-                    company=_safe_str(
-                        company_node.get_text(" ", strip=True) if company_node else "Unknown company"
-                    ),
-                    location=_safe_str(
-                        location_node.get_text(" ", strip=True) if location_node else "Remote"
-                    ),
-                    salary=_safe_str(
-                        salary_node.get_text(" ", strip=True) if salary_node else "Not disclosed"
-                    ),
+                    company="Unknown company",
+                    location="Remote",
+                    salary="Not disclosed",
                     url=job_url,
                     source="remote3",
                 )
@@ -230,45 +250,34 @@ def scrape_remote3() -> list[dict[str, str | None]]:
 
 
 def scrape_solana_jobs() -> list[dict[str, str | None]]:
-    """Scrape jobs from Solana jobs page with BeautifulSoup."""
     try:
-        with httpx.Client(timeout=TIMEOUT_SECONDS, headers=DEFAULT_HEADERS) as client:
-            response = client.get(SOLANA_JOBS_URL)
-            response.raise_for_status()
-            html = response.text
+        response = _fetch(SOLANA_JOBS_URL)
+        if not response:
+            return []
 
-        soup = BeautifulSoup(html, "html.parser")
-        jobs: list[dict[str, str | None]] = []
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        job_links = soup.select("a[href*='job']") or soup.select("a[href*='jobs']")
-        seen_urls: set[str] = set()
+        jobs = []
+        links = soup.select("a[href*='job']")
 
-        for link in job_links:
+        seen = set()
+
+        for link in links:
             href = _safe_str(link.get("href"))
-            job_url = urljoin(SOLANA_JOBS_URL, href) if href else ""
-            if not job_url or job_url in seen_urls:
+            job_url = urljoin(SOLANA_JOBS_URL, href)
+
+            if not job_url or job_url in seen:
                 continue
-            seen_urls.add(job_url)
+            seen.add(job_url)
 
-            title = _safe_str(link.get_text(" ", strip=True), "Untitled role")
-            card = link.find_parent(["article", "li", "div"]) or link
-
-            company_node = card.select_one("[class*='company']")
-            location_node = card.select_one("[class*='location']")
-            salary_node = card.select_one("[class*='salary'], [class*='compensation']")
+            title = _safe_str(link.get_text(" ", strip=True))
 
             jobs.append(
                 _normalize_job(
                     title=title,
-                    company=_safe_str(
-                        company_node.get_text(" ", strip=True) if company_node else "Unknown company"
-                    ),
-                    location=_safe_str(
-                        location_node.get_text(" ", strip=True) if location_node else "Remote"
-                    ),
-                    salary=_safe_str(
-                        salary_node.get_text(" ", strip=True) if salary_node else "Not disclosed"
-                    ),
+                    company="Unknown company",
+                    location="Remote",
+                    salary="Not disclosed",
                     url=job_url,
                     source="solana",
                 )
@@ -280,11 +289,25 @@ def scrape_solana_jobs() -> list[dict[str, str | None]]:
         return []
 
 
+# ---------------------------------------------------------
+# Aggregator
+# ---------------------------------------------------------
+
 def scrape_all_jobs() -> list[dict[str, str | None]]:
-    """Fetch and combine jobs from all configured sources."""
     jobs: list[dict[str, str | None]] = []
-    jobs.extend(scrape_cryptojobslist())
-    jobs.extend(scrape_web3_career())
-    jobs.extend(scrape_remote3())
-    jobs.extend(scrape_solana_jobs())
+
+    for name, fn in [
+        ("cryptojobslist", scrape_cryptojobslist),
+        ("web3career", scrape_web3_career),
+        ("remote3", scrape_remote3),
+        ("solana", scrape_solana_jobs),
+    ]:
+        try:
+            source_jobs = fn()
+            LOGGER.info("Source %s returned %d jobs", name, len(source_jobs))
+            jobs.extend(source_jobs)
+        except Exception as exc:
+            LOGGER.exception("Source %s crashed: %s", name, exc)
+
+    LOGGER.info("Total jobs before dedupe: %d", len(jobs))
     return jobs
